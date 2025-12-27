@@ -1,4 +1,4 @@
-# ChocDuino v0.9 — Duino-Coin ESP32 CYD Miner
+# ChocDuino v0.9.2 — Duino-Coin ESP32 CYD Miner
 
 ChocDuino is a Duino-Coin ESP32 miner with a custom **CYD (ESP32-2432S028)** TFT UI, an animated boot screen, and stability hardening for long-running operation.
 
@@ -138,4 +138,7 @@ Duino-Coin project code: MIT License
 
 ChocDuino UI modifications: MIT-compatible
 
+
 Please retain attribution when redistributing.
+
+As of 0.9.2 you need to replace the MiningJob.h also
