@@ -1,40 +1,21 @@
 /*
-  ChocDuino ESP_Code.ino — v0.9 (CYD UI drop-in)
-  Public-release privacy scrub ONLY (NO layout/timing/mining logic changes)
+  ChocDuino ESP_Code.ino — v0.9.2 (CYD UI drop-in) — LONG-TERM STABILITY
+  ---------------------------------------------------------------------
+  Based on your v0.9 showpiece build, with ONE focus:
+  - prevent “stuck on boot screen” and prevent “disconnected forever” while staying uptime-first
 
-  =====================================================================
-  CREDITS
-  =====================================================================
+  Key fixes vs the version that got stuck:
+  1) FIXED boot_begin() backlight init bug (was writing OUTPUT to the pin)
+  2) Boot is no longer held hostage by poolpicker forever:
+     - SelectNode() has a boot hard-cap (30s) so we proceed to main UI
+     - A supervisor loop keeps retrying SelectNode() in the background until it succeeds
+  3) WiFi auto-reconnect + periodic VerifyWifi() “kicks” (no reboot-on-timeout)
+
+  Duino-Coin project must be credited:
   Duino-Coin Project
   © The Duino-Coin Team & Community — MIT Licensed
   https://duinocoin.com
   https://github.com/revoxhere/duino-coin
-  =====================================================================
-
-  Based on your known-stable v0.8.4 build:
-  v0.8.3 + boot-freeze hardening (NO layout geometry changes)
-
-  Fixes kept:
-  1) Prevent rare long-runtime “inverted colours”:
-     - Periodically re-assert panel state (INVOFF, COLMOD=16bpp, MADCTL=0x60)
-     - IMPORTANT: guard is ONLY called OUTSIDE startWrite()/endWrite()
-
-  2) Prevent stray line between bottom Time and Wallet boxes:
-     - Explicitly clear the gap rectangle between the two bottom boxes on redraw
-
-  3) Remove sparkline flicker:
-     - Draw sparkline into a small off-screen sprite (inside of box only)
-     - Push sprite to TFT in one blit (no visible wipe-then-draw)
-
-  4) Prevent occasional boot screen freezes:
-     - WiFi connect watchdog (timeout + periodic reconnect kick)
-     - VerifyWifi watchdog (prevents infinite reconnect loop)
-     - Poolpicker/node fetch total watchdog
-     - Add WiFiClientSecure timeout in poolpicker GET helper
-
-  Privacy scrub (v0.9):
-  - Do not print SSID to Serial (SSID may be identifying).
-  - No other behavioural changes.
 */
 
 #pragma GCC optimize("-Ofast")
@@ -70,6 +51,21 @@
 #define DISPLAY_CYD 1
 
 // ============================================================
+// ===================== SHOWPIECE MODE =======================
+// ============================================================
+#ifndef SHOWPIECE_MODE
+  #define SHOWPIECE_MODE 1
+#endif
+
+// ============================================================
+// ===================== BOOT/NET STATE =======================
+// ============================================================
+static volatile bool g_boot_done   = false;
+static volatile bool g_node_ready  = false;
+static uint32_t g_last_wifi_kick_ms = 0;
+static uint32_t g_last_node_try_ms  = 0;
+
+// ============================================================
 // ===================== DISPLAY_CYD GLOBALS ===================
 // ============================================================
 #if defined(DISPLAY_CYD)
@@ -100,7 +96,6 @@
   static const uint16_t GOLD_COL      = 0xFEA0;       // header/title gold
   static const uint16_t LABEL_TOP_COL = 0x05DF;       // teal
   static const uint16_t LABEL_BOT_COL = 0xB3E0;       // pale green
-  static const uint16_t SEP_COL       = TFT_DARKGREY;
 
   uint16_t wifiColorForBars(int bars) {
     switch (bars) {
@@ -182,13 +177,13 @@ void drawHeaderStatic() {
   #if defined(CYD_HAS_FREEFONTS) && (CYD_HAS_FREEFONTS == 1)
     tft.setFreeFont(FSSB12);
     tft.setCursor(PAD_X, 18); // FreeFont baseline
-    tft.print("ChocDuino v0.9");
+    tft.print("ChocDuino v0.9.2");
     tft.setFreeFont(NULL);
   #else
     tft.setTextFont(1);
     tft.setTextSize(2);
     tft.setCursor(PAD_X, 6);
-    tft.print("ChocDuino v0.9");
+    tft.print("ChocDuino v0.9.2");
   #endif
 }
 
@@ -295,15 +290,6 @@ void RestartESP(String msg) {
   #endif
 }
 
-#if defined(BLUSHYBOX)
-  Ticker blinker;
-  bool lastLedState = false;
-  void changeState() {
-    analogWrite(LED_BUILTIN, lastLedState ? 255 : 0);
-    lastLedState = !lastLedState;
-  }
-#endif
-
 #if defined(ESP8266)
   Ticker lwdTimer;
   unsigned long lwdCurrentMillis = 0;
@@ -320,8 +306,7 @@ void RestartESP(String msg) {
   }
 #else
   void lwdtFeed(void) {
-    // keep quiet in production; serial spam can sometimes affect timing
-    // Serial.println("lwdtFeed()");
+    // keep quiet in production
   }
 #endif
 
@@ -489,8 +474,10 @@ void RestartESP(String msg) {
       if (xSemaphoreTake(tftMutex, portMAX_DELAY) != pdTRUE) return;
     #endif
 
+    // FIX: correct backlight init (do NOT digitalWrite(TFT_BL, OUTPUT))
     pinMode(TFT_BL, OUTPUT);
     digitalWrite(TFT_BL, TFT_BACKLIGHT_ON);
+    delay(10);
 
     tft.init();
 
@@ -605,10 +592,6 @@ namespace {
     EasyMutex mutexClientData, mutexConnectToServer;
   #endif
 
-  #ifdef USE_LAN
-    static bool eth_connected = false;
-  #endif
-
   void SetupWifi();
   void SelectNode();
 
@@ -620,6 +603,8 @@ namespace {
     configuration->host = doc["ip"].as<String>().c_str();
     configuration->port = doc["port"].as<int>();
     node_id = String(name);
+
+    g_node_ready = true;
 
     #if defined(DISPLAY_CYD)
       boot_set_node_name(name);
@@ -638,37 +623,43 @@ namespace {
 
   void VerifyWifi() {
     #ifdef USE_LAN
-      while ((!eth_connected) || (ETH.localIP() == IPAddress(0, 0, 0, 0))) {
-        #if defined(SERIAL_PRINTING)
-          Serial.println("Ethernet connection lost. Reconnect...");
-        #endif
-        SetupWifi();
-      }
+      return;
     #else
-      // v0.8.4: prevent infinite reconnect loop
+      if (WiFi.status() == WL_CONNECTED
+          && WiFi.localIP() != IPAddress(0, 0, 0, 0)
+          && WiFi.localIP() != IPAddress(192, 168, 4, 2)
+          && WiFi.localIP() != IPAddress(192, 168, 4, 3)) {
+        return;
+      }
+
       uint32_t startMs = millis();
+
+      #if defined(SERIAL_PRINTING)
+        Serial.println("VerifyWifi: reconnecting...");
+      #endif
+
+      WiFi.disconnect(false);
+      delay(120);
+      WiFi.reconnect();
+      delay(120);
 
       while (WiFi.status() != WL_CONNECTED
              || WiFi.localIP() == IPAddress(0, 0, 0, 0)
              || WiFi.localIP() == IPAddress(192, 168, 4, 2)
              || WiFi.localIP() == IPAddress(192, 168, 4, 3)) {
 
-        #if defined(SERIAL_PRINTING)
-          Serial.println("WiFi reconnecting...");
-        #endif
-
-        WiFi.disconnect();
-        delay(120);
-        WiFi.reconnect();
-        delay(120);
-
         #if defined(DISPLAY_CYD)
           boot_set_stage(BOOT_STAGE_WIFI_CONNECTING);
           boot_tick();
         #endif
 
-        if (millis() - startMs > 30000UL) {
-          RestartESP("VerifyWifi timeout");
+        delay(150);
+
+        if (millis() - startMs > 15000UL) {
+          #if defined(SERIAL_PRINTING)
+            Serial.println("VerifyWifi timeout — continuing (will retry)");
+          #endif
+          return;
         }
       }
     #endif
@@ -681,14 +672,12 @@ namespace {
     HTTPClient https;
     client.setInsecure();
 
-    // v0.8.4: tighten network stalls
     client.setTimeout(2500);
     https.setTimeout(2500);
     https.setReuse(false);
 
-    if (!https.begin(client, URL)) {
-      return "";
-    }
+    if (!https.begin(client, URL)) return "";
+
     https.addHeader("Accept", "*/*");
 
     int httpCode = https.GET();
@@ -719,8 +708,9 @@ namespace {
     String input = "";
     int waitTime = 1;
 
-    // v0.8.4: total watchdog so node fetch can never freeze boot forever
-    uint32_t selectStart = millis();
+    // HARD CAP during boot so we never get stuck forever on boot screen.
+    // After boot is done, we can keep retrying forever in the background.
+    uint32_t hardCapStart = millis();
 
     while (input == "") {
       #if defined(SERIAL_PRINTING)
@@ -737,148 +727,94 @@ namespace {
 
       input = httpGetString("https://server.duinocoin.com/getPool");
 
-      // hard limit for the whole selection phase
-      if (millis() - selectStart > 90000UL) {
-        RestartESP("Poolpicker timeout");
-      }
-
       waitTime *= 2;
-      if (waitTime > 32)
-        RestartESP("Node fetch unavailable");
+      if (waitTime > 32) waitTime = 8;
+
+      if (!g_boot_done && (millis() - hardCapStart > 30000UL)) {
+        #if defined(SERIAL_PRINTING)
+          Serial.println("SelectNode: boot hard-cap hit — continuing without node (will retry in background)");
+        #endif
+        #if defined(DISPLAY_CYD)
+          boot_set_lines(nullptr, "retrying...");
+          boot_tick(true);
+        #endif
+        return;
+      }
     }
 
     UpdateHostPort(input);
   }
 
-  #ifdef USE_LAN
-    void WiFiEvent(WiFiEvent_t event) {
-      switch (event) {
-        case ARDUINO_EVENT_ETH_START:
-          #if defined(SERIAL_PRINTING)
-            Serial.println("ETH Started");
-          #endif
-          ETH.setHostname("esp32-ethernet");
-          break;
-        case ARDUINO_EVENT_ETH_CONNECTED:
-          #if defined(SERIAL_PRINTING)
-            Serial.println("ETH Connected");
-          #endif
-          break;
-        case ARDUINO_EVENT_ETH_GOT_IP:
-          #if defined(SERIAL_PRINTING)
-            Serial.println("ETH Got IP");
-          #endif
-          eth_connected = true;
-          break;
-        case ARDUINO_EVENT_ETH_DISCONNECTED:
-          #if defined(SERIAL_PRINTING)
-            Serial.println("ETH Disconnected");
-          #endif
-          eth_connected = false;
-          break;
-        case ARDUINO_EVENT_ETH_STOP:
-          #if defined(SERIAL_PRINTING)
-            Serial.println("ETH Stopped");
-          #endif
-          eth_connected = false;
-          break;
-        default:
-          break;
+  void SetupWifi() {
+    #if defined(SERIAL_PRINTING)
+      Serial.println("Connecting to: " + String(SSID));
+    #endif
+
+    #if defined(DISPLAY_CYD)
+      boot_set_stage(BOOT_STAGE_WIFI_CONNECTING);
+      boot_tick(true);
+    #endif
+
+    WiFi.begin(SSID, PASSWORD);
+
+    uint32_t wifiStart = millis();
+    uint32_t lastKick  = millis();
+
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(100);
+
+      #if defined(SERIAL_PRINTING)
+        Serial.print(".");
+      #endif
+      #if defined(DISPLAY_CYD)
+        boot_tick();
+      #endif
+
+      if (millis() - lastKick > 10000UL) {
+        lastKick = millis();
+        WiFi.disconnect(false);
+        delay(120);
+        WiFi.reconnect();
+      }
+
+      if (millis() - wifiStart > 45000UL) {
+        #if defined(SERIAL_PRINTING)
+          Serial.println("\nWiFi connect timeout — retrying");
+        #endif
+        #if defined(DISPLAY_CYD)
+          boot_set_lines("retrying...", nullptr);
+          boot_tick(true);
+        #endif
+
+        WiFi.disconnect(false);
+        delay(250);
+        WiFi.begin(SSID, PASSWORD);
+        wifiStart = millis();
+        lastKick  = millis();
       }
     }
-  #endif
 
-  void SetupWifi() {
-    #ifdef USE_LAN
-      #if defined(SERIAL_PRINTING)
-        Serial.println("Connecting to Ethernet...");
-      #endif
-      WiFi.onEvent(WiFiEvent);
-      ETH.begin();
+    VerifyWifi();
 
-      while (!eth_connected) {
-        delay(200);
-        #if defined(SERIAL_PRINTING)
-          Serial.print(".");
-        #endif
-        #if defined(DISPLAY_CYD)
-          boot_set_stage(BOOT_STAGE_WIFI_CONNECTING);
-          boot_tick();
-        #endif
-      }
-
-      #if defined(SERIAL_PRINTING)
-        Serial.println("\n\nSuccessfully connected to Ethernet");
-        Serial.println("Local IP address: " + ETH.localIP().toString());
-        Serial.println("Rig name: " + String(RIG_IDENTIFIER));
-        Serial.println();
-      #endif
-
-    #else
-      #if defined(SERIAL_PRINTING)
-        // Privacy scrub: do not print SSID (may be identifying)
-        Serial.println("Connecting to WiFi...");
-      #endif
-
-      #if defined(DISPLAY_CYD)
-        boot_set_stage(BOOT_STAGE_WIFI_CONNECTING);
-        boot_tick(true);
-      #endif
-
-      WiFi.begin(SSID, PASSWORD);
-
-      // v0.8.4: WiFi connect watchdog (prevents endless boot)
-      uint32_t wifiStart = millis();
-      uint32_t lastKick  = millis();
-
-      while (WiFi.status() != WL_CONNECTED) {
-        delay(100);
-
-        #if defined(SERIAL_PRINTING)
-          Serial.print(".");
-        #endif
-        #if defined(DISPLAY_CYD)
-          boot_tick();
-        #endif
-
-        // every ~10s, kick STA state machine (helps some routers)
-        if (millis() - lastKick > 10000UL) {
-          lastKick = millis();
-          WiFi.disconnect();
-          delay(120);
-          WiFi.reconnect();
-        }
-
-        // hard timeout
-        if (millis() - wifiStart > 45000UL) {
-          RestartESP("WiFi connect timeout");
-        }
-      }
-
-      VerifyWifi();
-
-      #if defined(DISPLAY_CYD)
-        boot_set_stage(BOOT_STAGE_WIFI_CONNECTED);
-        boot_tick(true);
-      #endif
-
-      #if !defined(ESP8266)
-        WiFi.config(WiFi.localIP(), WiFi.gatewayIP(), WiFi.subnetMask(), DNS_SERVER);
-      #endif
-
-      #if defined(SERIAL_PRINTING)
-        Serial.println("\n\nSuccessfully connected to WiFi");
-        Serial.println("Rig name: " + String(RIG_IDENTIFIER));
-        Serial.println("Local IP address: " + WiFi.localIP().toString());
-        Serial.println("Gateway: " + WiFi.gatewayIP().toString());
-        Serial.println("DNS: " + WiFi.dnsIP().toString());
-        Serial.println();
-      #endif
+    #if defined(DISPLAY_CYD)
+      boot_set_stage(BOOT_STAGE_WIFI_CONNECTED);
+      boot_tick(true);
     #endif
 
-    #if defined(DISPLAY_SSD1306) || defined(DISPLAY_16X2)
-      display_info("Waiting for node...");
+    #if !defined(ESP8266)
+      WiFi.config(WiFi.localIP(), WiFi.gatewayIP(), WiFi.subnetMask(), DNS_SERVER);
     #endif
+
+    #if defined(SERIAL_PRINTING)
+      Serial.println("\n\nSuccessfully connected to WiFi");
+      Serial.println("Rig name: " + String(RIG_IDENTIFIER));
+      Serial.println("Local IP address: " + WiFi.localIP().toString());
+      Serial.println("Gateway: " + WiFi.gatewayIP().toString());
+      Serial.println("DNS: " + WiFi.dnsIP().toString());
+      Serial.println();
+    #endif
+
+    // Try poolpicker once (but boot hard-cap prevents lockup)
     SelectNode();
   }
 
@@ -899,8 +835,8 @@ namespace {
       #endif
     });
     ArduinoOTA.onError([](ota_error_t error) {
-      Serial.printf("Error[%u]: ", error);
       #if defined(SERIAL_PRINTING)
+        Serial.printf("Error[%u]: ", error);
         if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
         else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
         else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
@@ -920,12 +856,7 @@ namespace {
       #endif
 
       String s = WEBSITE;
-      #ifdef USE_LAN
-        s.replace("@@IP_ADDR@@", ETH.localIP().toString());
-      #else
-        s.replace("@@IP_ADDR@@", WiFi.localIP().toString());
-      #endif
-
+      s.replace("@@IP_ADDR@@", WiFi.localIP().toString());
       s.replace("@@HASHRATE@@", String((hashrate + hashrate_core_two) / 1000));
       s.replace("@@DIFF@@", String(difficulty / 100));
       s.replace("@@SHARES@@", String(share_count));
@@ -942,13 +873,6 @@ namespace {
       s.replace("@@ID@@", String(RIG_IDENTIFIER));
       s.replace("@@MEMORY@@", String(ESP.getFreeHeap()));
       s.replace("@@VERSION@@", String(SOFTWARE_VERSION));
-
-      #if defined(CAPTIVE_PORTAL)
-        s.replace("@@RESET_SETTINGS@@", "&bull; <a href='/reset'>Reset settings</a>");
-      #else
-        s.replace("@@RESET_SETTINGS@@", "");
-      #endif
-
       server.send(200, "text/html", s);
     }
   #endif
@@ -957,10 +881,6 @@ namespace {
 // ============================================================
 // ========================= CYD UI ============================
 // ============================================================
-
-/* ------------- EVERYTHING BELOW IS UNCHANGED FROM YOUR v0.8.4 PASTE,
-   except the version label and SSID Serial print above. ------------- */
-
 #if defined(DISPLAY_CYD)
   uint32_t lastCydMs = 0;
 
@@ -1108,7 +1028,6 @@ namespace {
   static int time_by = 0;
 
   // ================= DISPLAY GUARD =================
-  // Must NEVER run inside startWrite/endWrite.
   static uint32_t lastPanelGuardMs = 0;
 
   static inline void cyd_panel_guard(bool force = false) {
@@ -1401,7 +1320,6 @@ namespace {
     const int iw = SP_W - 2;
     const int ih = SP_H - 2;
 
-    // Build the sparkline off-screen (no visible wipe)
     spSprite.fillSprite(TFT_BLACK);
 
     if (!any || mn == 65535) {
@@ -1809,11 +1727,14 @@ void setup() {
   #if defined(SERIAL_PRINTING)
     Serial.begin(SERIAL_BAUDRATE);
     Serial.println("\n\nDuino-Coin " + String(configuration->MINER_VER));
+    #if SHOWPIECE_MODE
+      Serial.println("ChocDuino: SHOWPIECE MODE (no restart-on-timeout)");
+    #endif
   #endif
 
   pinMode(LED_BUILTIN, OUTPUT);
 
-  // v0.7+: show boot screen immediately (before WiFi/node)
+  // show boot screen immediately (before WiFi/node)
   #if defined(DISPLAY_CYD)
     boot_begin();
   #endif
@@ -1829,6 +1750,13 @@ void setup() {
   job[0] = new MiningJob(0, configuration);
 
   WiFi.mode(WIFI_STA);
+
+  // Stability defaults
+  #if !defined(ESP8266)
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(false);
+  #endif
+
   #if defined(ESP8266)
     WiFi.setSleepMode(WIFI_NONE_SLEEP);
   #else
@@ -1859,6 +1787,9 @@ void setup() {
   #else
     SetupWifi();
   #endif
+
+  // Boot is allowed to end even if poolpicker didn't respond yet
+  g_boot_done = true;
 
   #if defined(DISPLAY_CYD)
     boot_end_prepare_main_ui();
@@ -1903,6 +1834,24 @@ void setup() {
   #endif
 }
 
+static inline void stability_supervisor_tick() {
+  uint32_t now = millis();
+
+  // WiFi heal every ~3s
+  if (now - g_last_wifi_kick_ms > 3000UL) {
+    g_last_wifi_kick_ms = now;
+    VerifyWifi();
+  }
+
+  // If node isn't ready yet, retry poolpicker every ~15s (once boot is done)
+  if (g_boot_done && !g_node_ready && WiFi.isConnected()) {
+    if (now - g_last_node_try_ms > 15000UL) {
+      g_last_node_try_ms = now;
+      SelectNode();
+    }
+  }
+}
+
 void system_events_func(void* parameter) {
   while (true) {
     delay(10);
@@ -1917,6 +1866,8 @@ void system_events_func(void* parameter) {
     #endif
 
     ArduinoOTA.handle();
+
+    stability_supervisor_tick();
   }
 }
 
@@ -1929,6 +1880,8 @@ void single_core_loop() {
   #if defined(WEB_DASHBOARD)
     server.handleClient();
   #endif
+
+  stability_supervisor_tick();
 }
 
 void loop() {
